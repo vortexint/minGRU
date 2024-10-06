@@ -122,9 +122,9 @@ def main(rank, world_size, train_data_file, val_data_file, args):
 
         # Create DataLoaders
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
-                                  shuffle=(train_sampler is None), num_workers=0, pin_memory=True)
+                                  shuffle=(train_sampler is None), num_workers=6, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, sampler=val_sampler,
-                                shuffle=False, num_workers=0, pin_memory=True)
+                                shuffle=False, num_workers=6, pin_memory=True)
 
         # Optimizer
         optim = Adam(model.parameters(), lr=LEARNING_RATE)
@@ -157,7 +157,7 @@ def main(rank, world_size, train_data_file, val_data_file, args):
         else:
             # Wrap the model with DDP only if world_size > 1 and not loading a checkpoint
             if world_size > 1:
-                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank], output_device=rank)
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
 
         # Sampling helpers (same as before)
         def log(t, eps=1e-20):
