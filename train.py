@@ -17,6 +17,9 @@ import re
 
 from minGRU_pytorch.minGRULM import minGRULM
 
+# **Import SummaryWriter for TensorBoard**
+from torch.utils.tensorboard import SummaryWriter  # Added for TensorBoard logging
+
 class TokenizedTextDataset(Dataset):
     def __init__(self, data_file, seq_len):
         self.data_file = data_file
@@ -90,6 +93,13 @@ def main(rank, world_size, train_data_file, val_data_file, args):
         GENERATE_LENGTH = 128
         SEQ_LEN = 1024
         SAVE_LAST = args.save_last  # Number of last checkpoints to keep
+
+        # **Initialize TensorBoard SummaryWriter (only for rank 0)**
+        if rank == 0:
+            writer = SummaryWriter(log_dir=args.log_dir)  # Initialize SummaryWriter
+            print(f"TensorBoard logging enabled. Logs will be saved to {args.log_dir}")
+        else:
+            writer = None  # Other ranks do not write to TensorBoard
 
         # Load the SentencePiece tokenizer
         sp = spm.SentencePieceProcessor()
@@ -168,7 +178,7 @@ def main(rank, world_size, train_data_file, val_data_file, args):
             return -log(-log(noise))
 
         def gumbel_sample(t, temperature = 1., dim = -1, keepdim = True):
-            return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = dim, keepdim = keepdim)
+            return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = dim, keepdim=keepdim)
 
         def top_k(logits, thres=0.9):
             k = max(1, int((1 - thres) * logits.shape[-1]))
@@ -234,17 +244,30 @@ def main(rank, world_size, train_data_file, val_data_file, args):
                 scaler.update()
                 optim.zero_grad()
 
+                # **Log Training Loss to TensorBoard (only on rank 0)**
+                if rank == 0 and writer is not None:
+                    writer.add_scalar('Train/Loss', loss.item() * GRAD_ACCUM_EVERY, global_step=step)
+
                 # Validation and Generation (only on rank 0)
                 if rank == 0:
                     if step % VALIDATE_EVERY == 0:
                         model.eval()
                         with torch.no_grad():
-                            data = next(iter(val_loader))
-                            data = data.to(device)
+                            try:
+                                val_data_batch = next(iter(val_loader))
+                            except StopIteration:
+                                val_data_batch = None
 
-                            with autocast():
-                                val_loss = model(data, return_loss=True)
-                            print(f"Validation loss at epoch {epoch + 1}, step {step}: {val_loss.item():.3f}")
+                            if val_data_batch is not None:
+                                data_val = val_data_batch.to(device)
+
+                                with autocast():
+                                    val_loss = model(data_val, return_loss=True)
+                                print(f"Validation loss at epoch {epoch + 1}, step {step}: {val_loss.item():.3f}")
+
+                                # **Log Validation Loss to TensorBoard**
+                                if writer is not None:
+                                    writer.add_scalar('Validation/Loss', val_loss.item(), global_step=step)
                         model.train()
 
                     if step % GENERATE_EVERY == 0:
@@ -257,6 +280,10 @@ def main(rank, world_size, train_data_file, val_data_file, args):
                             prime = decode_tokens(inp.tolist())
                             print(f"Prime text:\n{prime}\n{'*' * 100}")
 
+                            # **Log Prime Text to TensorBoard**
+                            if writer is not None:
+                                writer.add_text('Generate/Prime', prime, global_step=step)
+
                             prompt = inp.unsqueeze(0)  # Add batch dimension
 
                             sampled = base_decoding(model, prompt, PRIME_LENGTH + GENERATE_LENGTH)
@@ -265,7 +292,11 @@ def main(rank, world_size, train_data_file, val_data_file, args):
                             base_decode_output = decode_tokens(sampled_ids)
 
                             print(f"Generated text:\n{base_decode_output}\n")
-                        
+
+                            # **Log Generated Text to TensorBoard**
+                            if writer is not None:
+                                writer.add_text('Generate/Output', base_decode_output, global_step=step)
+                            
                             
                         model.train()
 
@@ -307,8 +338,8 @@ def main(rank, world_size, train_data_file, val_data_file, args):
                                     except Exception as e:
                                         print(f"Error removing checkpoint {old_cp}: {e}")
 
-            # Update the starting step after each epoch
-            start_step += len(train_loader)
+                # Update the starting step after each epoch
+                start_step += len(train_loader)
 
         # Final Checkpoint after training
         if rank == 0:
@@ -322,6 +353,11 @@ def main(rank, world_size, train_data_file, val_data_file, args):
             checkpoint_filename = f'checkpoint-final.pt'
             torch.save(checkpoint, checkpoint_filename)
             print(f"Final checkpoint saved to {checkpoint_filename}")
+
+            # **Close the TensorBoard writer**
+            if writer is not None:
+                writer.close()
+                print("TensorBoard writer closed.")
 
         # Clean up
         if world_size > 1:
@@ -356,6 +392,9 @@ if __name__ == '__main__':
 
     # New argument for rolling checkpoint
     parser.add_argument('--save_last', type=int, default=2, help='Number of last checkpoints to keep.')
+
+    # **New argument for TensorBoard log directory**
+    parser.add_argument('--log_dir', type=str, default='runs', help='Directory to save TensorBoard logs.')
 
     args = parser.parse_args()
 
