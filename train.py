@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.optim import Adam
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
 import os
@@ -20,31 +20,25 @@ from minGRU_pytorch.minGRULM import minGRULM
 # **Import SummaryWriter for TensorBoard**
 from torch.utils.tensorboard import SummaryWriter  # Added for TensorBoard logging
 
-class TokenizedTextDataset(Dataset):
-    def __init__(self, data_file, seq_len):
+class ChunkedTextDataset(IterableDataset):
+    def __init__(self, data_file, seq_len, chunk_size=1024 * 1024):
         self.data_file = data_file
         self.seq_len = seq_len
-        self.data = np.load(self.data_file, allow_pickle=True)
+        self.chunk_size = chunk_size
+        self.sp = spm.SentencePieceProcessor()
+        self.sp.load('tokenizer.model')  # Make sure tokenizer.model is in the correct location
 
-    def __len__(self):
-        return (len(self.data) - self.seq_len) // self.seq_len
+    def __iter__(self):
+        with open(self.data_file, 'r', encoding='utf-8') as file:  # Open in text mode
+            while True:
+                chunk = file.read(self.chunk_size)
+                if not chunk:
+                    break  # End of file
 
-    def __getitem__(self, index):
-        start_idx = index * self.seq_len
-        end_idx = start_idx + self.seq_len + 1
-        full_seq = torch.tensor(self.data[start_idx:end_idx], dtype=torch.long)
-        return full_seq
+                token_ids = self.sp.encode(chunk)
 
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        # Exclude the data attribute from being pickled
-        state['data'] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        # Re-load the data
-        self.data = np.load(self.data_file, allow_pickle=True)
+                for i in range(0, len(token_ids) - self.seq_len - 1, self.seq_len):
+                    yield torch.tensor(token_ids[i:i + self.seq_len + 1], dtype=torch.long)
 
 
 def remove_module_prefix(state_dict):
@@ -77,8 +71,12 @@ def main(rank, world_size, train_data_file, val_data_file, args):
 
         print(f"Rank {rank} using device: {device}")
 
-        val_data = np.load(val_data_file, allow_pickle=True)
-        val_data = val_data.tolist()
+        # Load validation data (only on rank 0)
+        if rank == 0:
+            val_data = np.load(val_data_file, allow_pickle=True)
+            val_data = val_data.tolist()
+        else:
+            val_data = None  # Other ranks don't need validation data
 
         # Constants and Hyperparameters
         NUM_EPOCHS = args.num_epochs  # Number of epochs to train
@@ -104,9 +102,8 @@ def main(rank, world_size, train_data_file, val_data_file, args):
         # Load the SentencePiece tokenizer
         sp = spm.SentencePieceProcessor()
         sp.load('tokenizer.model')
-
-        # Get vocabulary size
         vocab_size = sp.get_piece_size()
+
         if rank == 0:
             print(f"Vocabulary size: {vocab_size}")
 
@@ -119,22 +116,19 @@ def main(rank, world_size, train_data_file, val_data_file, args):
 
 
         # Create datasets
-        train_dataset = TokenizedTextDataset(train_data_file, SEQ_LEN)
-        val_dataset = TokenizedTextDataset(val_data_file, SEQ_LEN)
+        train_dataset = ChunkedTextDataset(train_data_file, SEQ_LEN)
 
-        # Create Distributed Samplers if world_size > 1
         if world_size > 1:
-            train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
-            val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
+            train_sampler = DistributedSampler(train_dataset)
         else:
             train_sampler = None
-            val_sampler = None
 
         # Create DataLoaders
         train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
                                   shuffle=(train_sampler is None), num_workers=6, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, sampler=val_sampler,
-                                shuffle=False, num_workers=6, pin_memory=True)
+        if rank == 0:  # Validation loader only on rank 0
+            val_dataset = ChunkedTextDataset(val_data_file, SEQ_LEN)  # Use ChunkedTextDataset
+            val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
 
         # Optimizer
         optim = Adam(model.parameters(), lr=LEARNING_RATE)
